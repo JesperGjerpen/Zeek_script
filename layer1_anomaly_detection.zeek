@@ -1,176 +1,118 @@
-## layer1_anomaly_detection.zeek
-##
-## Purpose:
-##   - Use standard Zeek protocol analyzers (conn/http/dns/ssl) to log:
-##       * conn.log
-##       * http.log  (via http_request)
-##       * dns.log   (via dns_request)
-##       * ssl.log
-##   - Raise notices for:
-##       * High-frequency callbacks (many connections/requests from one origin in a short window)
-##       * Large data transfers (very large amount of bytes on a single connection)
-##
-## Usage:
-##   - Place this script where Zeek can load it (e.g. /opt/zeek/share/zeek/site/).
-##   - Add `@load layer1_anomaly_detection` to local.zeek.
-##   - Deploy with `zeekctl deploy`.
-
 @load base/protocols/conn
-@load base/protocols/http
-@load base/protocols/dns
-@load base/protocols/ssl
-@load base/frameworks/notice
+@load base/protocols/mqtt/main
+@load base/frameworks/logging
 
-############################
-# Custom Notice Types
-############################
+module C2;
 
-redef enum Notice::Type += {
-    High_Frequency_Callback,
-    Large_Data_Transfer
-};
+export {
+    # Custom log record for suspected MQTT C2 flows.
+    type C2Record: record {
+        ts: time        &log;  # timestamp
+        uid: string     &log;  # Zeek connection UID
+        id: conn_id     &log;  # 4-tuple (orig/resp IP/port)
+        sensor_id: string &log &optional;  # which sensor VM this came from
+        reason: string  &log;  # why we flagged it (heuristic description)
+    };
 
-############################
-# Tunable Parameters
-############################
+    # Custom log stream ID
+    redef enum Log::ID += { LOG_C2_MQTT_CANDIDATES };
 
-# Time window for counting callbacks per origin host.
-const callback_window: interval = 60secs &redef;
+    # Per-VM sensor identifier (override in local.zeek)
+    const c2_sensor_id: string &redef = "unknown-sensor";
 
-# Thresholds for what we treat as "high frequency" callbacks.
-const http_callback_threshold: count = 20 &redef;  # HTTP requests per origin IP per window
-const dns_callback_threshold:  count = 30 &redef;  # DNS queries per origin IP per window
-const ssl_callback_threshold:  count = 15 &redef;  # SSL/TLS connections per origin IP per window
+    # MQTT ports (plaintext)
+    const mqtt_ports: set[port] = { 1883/tcp } &redef;
 
-# Large data transfer threshold (total bytes in a connection).
-# Default: 10 MB.
-const large_transfer_threshold: count = 10 * 1024 * 1024 &redef;
+    # Heuristic 1: long-lived, low-volume MQTT "beacon" flow
+    const mqtt_min_beacon_duration: interval = 60secs &redef;
+    const mqtt_max_beacon_bytes: count = 20000 &redef; # ~20 KB total bytes
 
-############################
-# State Tables
-############################
+    # Heuristic 2: high-frequency MQTT connects from same origin
+    const mqtt_connect_window: interval = 60secs &redef;
+    const mqtt_connect_threshold: count = 20 &redef;
+}
 
-# Count HTTP requests per origin host within 'callback_window'.
-global http_callback_counter: table[addr] of count
-    &write_expire = callback_window;
+# Per-origin counter of MQTT connects within a sliding window
+global mqtt_connect_counter: table[addr] of count
+    &write_expire = C2::mqtt_connect_window;
 
-# Count DNS queries per origin host within 'callback_window'.
-global dns_callback_counter: table[addr] of count
-    &write_expire = callback_window;
-
-# Count SSL handshakes per origin host within 'callback_window'.
-global ssl_callback_counter: table[addr] of count
-    &write_expire = callback_window;
-
-############################
-# Helper: Increment + Check
-############################
-
-function increment_and_check(
-    tbl: table[addr] of count,
-    key: addr,
-    threshold: count,
-    note: Notice::Type,
-    msg: string,
-    c: connection
-    )
+# Create the custom log stream at startup
+event zeek_init()
     {
-    if ( key !in tbl )
-        tbl[key] = 0;
+    Log::create_stream(C2::LOG_C2_MQTT_CANDIDATES,
+        [$columns = C2::C2Record,
+         $path    = "c2_mqtt_candidates"]);
+    }
 
-    tbl[key] += 1;
+# Write one C2 candidate entry to c2_mqtt_candidates.log
+function log_c2_candidate(c: connection, reason: string)
+    {
+    local rec: C2::C2Record = [
+        $ts        = network_time(),
+        $uid       = c$uid,
+        $id        = c$id,
+        $sensor_id = C2::c2_sensor_id,
+        $reason    = reason
+    ];
 
-    if ( tbl[key] > threshold )
+    Log::write(C2::LOG_C2_MQTT_CANDIDATES, rec);
+    }
+
+##########################
+# Heuristic 2: high-frequency connects
+##########################
+
+event connection_established(c: connection)
+    {
+    # Only care about MQTT flows (standard port or recognized by analyzer)
+    if ( !(c$id$resp_p in C2::mqtt_ports || c?$mqtt) )
+        return;
+
+    local orig = c$id$orig_h;
+
+    if ( orig !in mqtt_connect_counter )
+        mqtt_connect_counter[orig] = 0;
+
+    mqtt_connect_counter[orig] += 1;
+
+    if ( mqtt_connect_counter[orig] > C2::mqtt_connect_threshold )
         {
-        NOTICE([$note = note,
-                $msg  = msg,
-                $conn = c]);
+        local reason = fmt("High-frequency MQTT connects from %s to %s:%d "
+                           "(count in %s window: %d)",
+                           orig, c$id$resp_h, c$id$resp_p,
+                           C2::mqtt_connect_window, mqtt_connect_counter[orig]);
+
+        log_c2_candidate(c, reason);
         }
     }
 
-############################
-# HTTP: High-frequency callbacks
-############################
+##########################
+# Heuristic 1: long-lived, low-volume MQTT flows
+##########################
 
-# This event fires when Zeek sees an HTTP request and will also drive http.log.
-event http_request(c: connection, method: string, host: string, uri: string, version: string)
-    {
-    local orig = c$id$orig_h;
-
-    local msg = fmt("High-frequency HTTP callbacks from %s: %s %s%s -> %s",
-                    orig, method, host, uri, c$id$resp_h);
-
-    increment_and_check(http_callback_counter,
-                        orig,
-                        http_callback_threshold,
-                        High_Frequency_Callback,
-                        msg,
-                        c);
-    }
-
-############################
-# DNS: High-frequency callbacks
-############################
-
-# This event drives dns.log entries for queries.
-event dns_request(c: connection, msg: dns_msg, query: string)
-    {
-    local orig = c$id$orig_h;
-
-    local msg_text = fmt("High-frequency DNS callbacks from %s: query=%s",
-                         orig, query);
-
-    increment_and_check(dns_callback_counter,
-                        orig,
-                        dns_callback_threshold,
-                        High_Frequency_Callback,
-                        msg_text,
-                        c);
-    }
-
-############################
-# SSL: High-frequency callbacks
-############################
-
-# Called when an SSL/TLS session is established (drives ssl.log).
-event ssl_established(c: connection)
-    {
-    local orig = c$id$orig_h;
-
-    local msg = fmt("High-frequency SSL/TLS callbacks from %s to %s:%d",
-                    orig, c$id$resp_h, c$id$resp_p);
-
-    increment_and_check(ssl_callback_counter,
-                        orig,
-                        ssl_callback_threshold,
-                        High_Frequency_Callback,
-                        msg,
-                        c);
-    }
-
-############################
-# Large Data Transfers
-############################
-
-# This event runs when Zeek finalizes state for a connection (drives conn.log).
 event connection_state_remove(c: connection)
     {
+    # Only care about MQTT flows
+    if ( !(c$id$resp_p in C2::mqtt_ports || c?$mqtt) )
+        return;
+
     local ci = c$conn;
 
-    if ( ci?$orig_bytes && ci?$resp_bytes )
+    if ( ci?$orig_bytes && ci?$resp_bytes && ci?$duration )
         {
         local total: count = ci$orig_bytes + ci$resp_bytes;
 
-        if ( total >= large_transfer_threshold )
+        if ( ci$duration >= C2::mqtt_min_beacon_duration &&
+             total       <= C2::mqtt_max_beacon_bytes )
             {
-            local msg = fmt("Large data transfer on %s:%d -> %s:%d (%d bytes total)",
-                            c$id$orig_h, c$id$orig_p,
-                            c$id$resp_h, c$id$resp_p,
-                            total);
+            local reason = fmt("MQTT beacon-like flow %s:%d -> %s:%d "
+                               "(dur=%.1fs, bytes=%d)",
+                               c$id$orig_h, c$id$orig_p,
+                               c$id$resp_h, c$id$resp_p,
+                               ci$duration, total);
 
-            NOTICE([$note = Large_Data_Transfer,
-                    $msg  = msg,
-                    $conn = c]);
+            log_c2_candidate(c, reason);
             }
         }
     }
+  
