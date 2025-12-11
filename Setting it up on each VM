@@ -1,0 +1,52 @@
+Zeek installed under /opt/zeek
+You use /opt/zeek/custom as the local clone of your GitHub repo
+This script is at /opt/zeek/custom/scripts/layer1_mqtt_c2_candidates.zeek
+
+1. On each VM:
+sudo mkdir -p /opt/zeek/custom
+cd /opt/zeek/custom
+
+# First time:
+sudo git clone https://github.com/<your-username>/<your-repo>.git .
+
+# Later:
+# sudo git pull
+
+2. Symlink the script into zeek's site directory
+cd /opt/zeek/share/zeek/site
+sudo ln -s /opt/zeek/custom/scripts/layer1_mqtt_c2_candidates.zeek .
+
+3. Configure "local.zeek" for each VM:
+edit:
+  sudo nano /opt/zeek/share/zeek/site/local.zeek
+Add or check to have:
+  @load base/protocols/mqtt/main
+  @load layer1_mqtt_c2_candidates
+
+  # Set a unique sensor id per VM:
+  redef C2::c2_sensor_id = "victim-sensor";     # on the victim VM
+  # redef C2::c2_sensor_id = "iot-sensor";     # on IoT VM
+  # redef C2::c2_sensor_id = "vmnet4-sensor";  # on VMnet4 VM
+
+4. Deploy zeek:
+cd /opt/zeek/bin
+sudo ./zeekctl deploy
+sudo ./zeekctl status
+
+  YOu should se: zeek   standalone   localhost   running  <pid>  <time>
+
+5. Verify the c2 candidates log:
+cd /opt/zeek/logs/current
+ls
+# conn.log dns.log mqtt.log notice.log c2_mqtt_candidates.log ...
+
+cat c2_mqtt_candidates.log
+
+Should see lines containing:
+- ts, uid, id.orig_h, id.resp_h, …
+- sensor_id (e.g. victim-sensor)
+- anomaly_type (timing-irregularity, header-inconsistency, protocol-misuse)
+- reason (human-readable text)
+
+Those are exactly the flows you’ll feed to RITA (by filtering conn.log/dns.log based on these uids).
+
