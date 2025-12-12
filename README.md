@@ -1,33 +1,7 @@
-# Zeek_script
-This repository contains Zeek scripts designed for use as Layer-1 detection components in a multi-sensor environment. Each sensor VM runs Zeek locally, tags its logs with a unique sensor identifier, and performs lightweight anomaly detection before logs are forwarded to a central RITA instance for Layer-2 analysis.
+This repository contains the Zeek Layer-1 detection script used to identify potential command-and-control (C2) activity transported over MQTT. The goal of the Layer-1 sensor is not to perform deep payload inspection, but to analyse the behavioural and structural properties of MQTT connections and flag those that deviate from normal traffic patterns. By doing this pre-filtering at the sensor level, only meaningful anomalies are forwarded for further evaluation in Layer-2, significantly reducing the volume of data that must be processed by RITA.
 
-How this behaves in practice
-Standard logs:
-Just by loading base/protocols/conn/http/dns/ssl, Zeek already writes:
--	conn.log
--	http.log
--	dns.log
--	ssl.log
-This script does not replace those it only adds notice.log entries based on their activity.
+The provided Zeek script, layer1_mqtt_c2_candidates.zeek, monitors plaintext MQTT traffic (typically port 1883/tcp) and applies three classes of heuristics: timing irregularities, header inconsistencies, and protocol misuse. Timing-based anomalies include high-frequency MQTT connection attempts from the same client as well as long-lived, low-volume flows that resemble periodic beaconing behaviour. Header inconsistencies focus on suspicious MQTT CONNECT metadata such as malformed protocol versions or missing client identifiers. Protocol misuse is captured using Zeek’s native weird framework, allowing the script to detect MQTT-specific parsing issues or behaviours that violate normal protocol semantics. When any of these conditions are met, the sensor writes an enriched entry to a dedicated log stream: c2_mqtt_candidates.log.
 
-High-frequency callbacks:
-For each origin IP:
--	Count HTTP requests, DNS queries, and SSL connections within a rolling callback_window (default 60 seconds).
--	If the count exceeds the configured thresholds, a High_Frequency_Callback notice is raised: Visible in notice.log.
-Includes the origin IP, destination, and basic context (method/host/URI or query).
+Each entry in this log includes a timestamp, unique Zeek UID, 4-tuple connection identifier, the sensor ID of the VM where the event occurred, the anomaly type, and a human-readable explanation of why the flow was flagged. This file forms the hand-off point between Layer-1 and Layer-2. Although Zeek continues to generate its standard logs (conn.log, dns.log, mqtt.log, etc.), only the UIDs listed in c2_mqtt_candidates.log are used to build the Layer-2 dataset. On the RITA analysis host, these UIDs are used to extract the corresponding rows from conn.log (and optionally DNS logs), creating a compact “C2-only” dataset for import into RITA.
 
-Large data transfers:
-On connection_state_remove, it sums orig_bytes + resp_bytes. If that exceeds large_transfer_threshold (default 10 MB), a Large_Data_Transfer notice is raised.
-
-How to use it in your Vms:
-1.	On each VM, clone/pull the repo into /opt/zeek/custom
-2.	Symlink into zeek’s site directory: 
-cd /opt/zeek/share/zeek/site
-sudo ln -s /opt/zeek/custom/scripts/layer1_anomaly_detection.zeek .
-3.	In /opt/zeek/share/zeek/site/local.zeek add: 
-@load sensor-id
-@load layer1_anomaly_detection
-4.	Redeploy:
-cd /opt/zeek/bin
-sudo ./zeekctl deploy
-sudo ./zeekctl status
+This design mirrors the intent of the multi-layer IDS architecture: Zeek performs lightweight, event-driven anomaly detection, while RITA performs heavy statistical processing, such as beacon scoring and inter-arrival-time analysis, but only on flows that merit deeper scrutiny. The result is a scalable, efficient system that focuses analytic effort where it is most likely to uncover covert C2 behaviour.
